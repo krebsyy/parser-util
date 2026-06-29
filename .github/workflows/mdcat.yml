@@ -1,0 +1,80 @@
+name: Prototype Testing
+
+on:
+  schedule:
+    - cron: '0 3 * * *'    # 8:00 AM PKT  (UTC+5 = 03:00 UTC)
+    - cron: '0 9 * * *'    # 2:00 PM PKT
+    - cron: '0 15 * * *'   # 8:00 PM PKT
+    - cron: '0 21 * * *'   # 2:00 AM PKT
+  workflow_dispatch:
+
+permissions:
+  contents: write          # needed to commit state.json back
+
+jobs:
+
+  # ── Job 1: Find today's new challan range ──────────────────────────────────
+  discover:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix:    ${{ steps.split.outputs.matrix }}
+      new_upper: ${{ steps.split.outputs.new_upper }}
+      has_new:   ${{ steps.split.outputs.has_new }}
+      scan_end:  ${{ steps.split.outputs.scan_end }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      - run: pip install -r requirements.txt
+      - id: split
+        run: python discover.py
+
+  # ── Job 2: Scrape new challans in 5 parallel chunks ───────────────────────
+  scrape:
+    needs: discover
+    if: needs.discover.outputs.has_new == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.discover.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install curl_cffi==0.7.4 pdfplumber openpyxl
+
+      - name: Scrape ${{ matrix.chunk.start }} to ${{ matrix.chunk.end }}
+        run: |
+          python scrape.py \
+            --start ${{ matrix.chunk.start }} \
+            --end   ${{ matrix.chunk.end }} \
+            --delay 0.05
+        timeout-minutes: 120
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: data-${{ matrix.chunk.start }}
+          path: |
+            applicants_*.json
+            applicants_*.xlsx
+          retention-days: 90
+
+  # ── Job 3: Save new upper bound back to repo ───────────────────────────────
+  update_state:
+    needs: [discover, scrape]
+    if: needs.discover.outputs.has_new == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Update state.json
+        run: |
+          echo '{"last_id": ${{ needs.discover.outputs.new_upper }}}' > state.json
+          git config user.name "krebsyy"
+          git config user.email "krebsyy@users.noreply.github.com"
+          git add state.json
+          git diff --cached --quiet || git commit -m "state: advance last_id to ${{ needs.discover.outputs.new_upper }}"
+          git push
